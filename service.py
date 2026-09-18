@@ -140,8 +140,8 @@ def make_app(adapter: QuillboxAdapter = None, sid: str = "", adapter_secret: str
 
     @app.get("/status")
     def status():
-        return {"system_id": sid, "live_version": ad.live_version, "applies_received": len(ad.applies),
-                "recent_applies": ad.applies[-5:]}
+        return {"system_id": sid, "live_version": ad.live_version, "synced_from_owl": getattr(ad, "synced", False),
+                "applies_received": len(ad.applies), "recent_applies": ad.applies[-5:]}
 
     return app
 
@@ -151,7 +151,26 @@ def build_app_from_env() -> FastAPI:
     adapter_secret = os.environ.get("QB_ADAPTER_SECRET", "")
     connector_secrets = json.loads(os.environ.get("QB_CONNECTOR_SECRETS", "{}"))
     driver_key = os.environ.get("QB_DRIVER_KEY", "")
-    return make_app(sid=sid, adapter_secret=adapter_secret, connector_secrets=connector_secrets, driver_key=driver_key)
+    ad = QuillboxAdapter()
+    sync_from_owl(ad, sid, os.environ.get("QB_OWL_BASE_URL", ""), os.environ.get("QB_RUNTIME_KEY", ""))
+    return make_app(ad, sid=sid, adapter_secret=adapter_secret, connector_secrets=connector_secrets, driver_key=driver_key)
+
+
+def sync_from_owl(ad: QuillboxAdapter, sid: str, owl_base: str, runtime_key: str):
+    """A fresh container boots on whatever candidate is baked into the image (v0), while OWL's ledger says what
+    was actually promoted. Found live, round 136: after a redeploy, check-ins measured v0 while OWL held v1 live.
+    So at startup, ask OWL what's live and apply it -- the same thing every other tenant here does on a cold
+    start. If OWL can't be reached, stay on the baked-in version and say so on /status, rather than guess."""
+    ad.synced = False
+    if not (owl_base and sid and runtime_key): return
+    try:
+        r = httpx.get(f"{owl_base}/v1/systems/{sid}", headers={"Authorization": "Bearer " + runtime_key}, timeout=15.0)
+        live = ((r.json() or {}).get("x") or {}).get("build_version") if r.status_code == 200 else None
+        if live and live != ad.live_version and (CANDIDATES / live / "quillbox_app").exists():
+            ad.apply({"build_version": live}, {"everyone": True})
+        ad.synced = live is not None
+    except Exception:
+        pass
 
 
 app = build_app_from_env()

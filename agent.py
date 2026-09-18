@@ -10,11 +10,10 @@ calls the OWL API. Holds both of system F's keys. Its job, each time a candidate
      returns a verdict on what already happened, never an instruction for what to build next
      (round 130's pushback #2); that choice is this file's own, not read off OWL
 """
+import hashlib
+import hmac
 import json
-import subprocess
-import sys
 import time
-from pathlib import Path
 
 DEF = dict(
     name="quillbox-fast",
@@ -62,7 +61,8 @@ class QuillAgent:
     """The OWL-facing identity for system F. `owl` is an httpx.Client already pointed at the live
     service; `witness_fn` defaults to witness.py's real witness_report, swappable in tests."""
 
-    def __init__(self, owl, sid=None, owner_key=None, runtime_key=None, witness_fn=None):
+    def __init__(self, owl, sid=None, owner_key=None, runtime_key=None, witness_fn=None,
+                 qb=None, adapter_secret=None, driver_key=None):
         self.owl = owl
         self.sid = sid
         self.owner_key = owner_key
@@ -70,6 +70,9 @@ class QuillAgent:
         self.witness_fn = witness_fn
         self.connector_secrets = {}
         self.week = 0
+        self.qb = qb                          # httpx.Client on the real deployed Quillbox service
+        self.adapter_secret = adapter_secret   # signs calls to qb's /apply and /revert, like OWL's own actuator would
+        self.driver_key = driver_key           # authorizes calls to qb's /run-week
 
     def register(self):
         r = self.owl.post("/v1/systems", json={"name": "quillbox-fast"}); r.raise_for_status()
@@ -111,40 +114,63 @@ class QuillAgent:
         r.raise_for_status()
         return r.json()["secret"]
 
-    def evaluate_candidate(self, name: str) -> dict:
-        """Real witness numbers for a candidate, entirely offline -- never touches OWL or the live
-        deployed adapter. Runs as its own subprocess (evaluate_candidate.py) so nothing about a
-        previous import ever leaks in, the same lesson witness.py's compliance_scan already learned
-        the hard way (round 132)."""
-        r = subprocess.run([sys.executable, str(Path(__file__).parent / "evaluate_candidate.py"), name],
-                            capture_output=True, text=True)
-        r.check_returncode()
-        return json.loads(r.stdout)
+    def _sign(self, body: bytes) -> str:
+        return hmac.new(self.adapter_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
-    def promote_if_better(self, candidate: str, current: str) -> dict:
+    def _apply_live(self, version: str) -> dict:
+        """A real, signed call to the deployed adapter's own /apply -- the same call OWL's actuator
+        would make, just issued by Quill Agent directly, since Quill Agent is already standing in
+        for OWL's own orchestration role here (round 132: OWL's trial mechanism cannot judge a
+        one-unit system, so the decision of when to try something moved to Quill Agent already)."""
+        body = json.dumps({"version": {"build_version": version}, "slice": {"everyone": True}}).encode("utf-8")
+        r = self.qb.post("/apply", content=body, headers={"x-owl-signature": self._sign(body)}); r.raise_for_status()
+        return r.json()
+
+    def _revert_live(self, version: str) -> dict:
+        body = json.dumps({"version": {"build_version": version}, "slice": {"everyone": True}}).encode("utf-8")
+        r = self.qb.post("/revert", content=body, headers={"x-owl-signature": self._sign(body)}); r.raise_for_status()
+        return r.json()
+
+    def _measure_live(self, week: int) -> dict:
+        """Whatever's currently applied on the real deployed adapter, measured for real via its own
+        /run-week -- which also delivers the reading to OWL as a real record, honestly, win or
+        lose, before this agent has decided anything."""
+        r = self.qb.post(f"/run-week/{week}", headers={"Authorization": "Bearer " + self.driver_key})
+        r.raise_for_status(); report = r.json()
+        c = self.owl.post(f"/v1/systems/{self.sid}/cycle/{week}", headers=self._runtime_hdr()); c.raise_for_status()
+        self.week = week
+        return report
+
+    def promote_if_better(self, candidate: str, current: str, week: int) -> dict:
         """OWL's own trial mechanism can't confirm a gain here -- system F has one unit, so there
         is never a control group to compare against (round 132, instances/owl-build.md). Quill
-        Agent's own job, not OWL's: evaluate both versions for real, offline, and if the candidate
-        clears every guard and is at least as good on every goal as the current version, promote
-        it by replacing build_version's sole option -- the exact PUT /definition call that
-        registered the very first version, not a new mechanism (round 133). If it doesn't clear
-        the bar, OWL is never touched at all."""
-        cand = self.evaluate_candidate(candidate)
-        cur = self.evaluate_candidate(current)
+        Agent's own job, not OWL's: apply the candidate for real on the live adapter, measure it
+        for real, and compare against a fresh real measurement of the current version -- exactly
+        the real apply/measure/revert-if-it-doesn't-work-out mechanism every other tenant here
+        already uses, just decided by Quill Agent instead of OWL's broken trial math. If the
+        candidate clears every guard and is at least as good on every goal, it stays applied and
+        Quill Agent promotes it in OWL's Definition too -- the same PUT /definition call that
+        registered the very first version, not a new mechanism. If it doesn't clear the bar, it's
+        reverted back to the current version on the live adapter, and OWL's Definition is never
+        touched at all."""
+        self._apply_live(current); cur = self._measure_live(week)
+        self._apply_live(candidate); cand = self._measure_live(week + 1)
 
-        for g in DEF["guards"]:
-            m, limit, rule = g["measure"], g["limit"], g["rule"]
-            if rule == "max" and cand[m] > limit:
-                return {"promoted": False, "reason": f"{m}={cand[m]} exceeds guard max {limit}", "candidate": cand, "current": cur}
-            if rule == "min" and cand[m] < limit:
-                return {"promoted": False, "reason": f"{m}={cand[m]} below guard min {limit}", "candidate": cand, "current": cur}
+        def failing():
+            for g in DEF["guards"]:
+                m, limit, rule = g["measure"], g["limit"], g["rule"]
+                if rule == "max" and cand[m] > limit: return f"{m}={cand[m]} exceeds guard max {limit}"
+                if rule == "min" and cand[m] < limit: return f"{m}={cand[m]} below guard min {limit}"
+            for r in DEF["goal"]:
+                m = r["measure"]
+                if r["rel"] == "max" and cand[m] < cur[m]: return f"{m} did not improve: {cand[m]} vs current {cur[m]}"
+                if r["rel"] == "min" and cand[m] > cur[m]: return f"{m} did not improve: {cand[m]} vs current {cur[m]}"
+            return None
 
-        for r in DEF["goal"]:
-            m = r["measure"]
-            if r["rel"] == "max" and cand[m] < cur[m]:
-                return {"promoted": False, "reason": f"{m} did not improve: {cand[m]} vs current {cur[m]}", "candidate": cand, "current": cur}
-            if r["rel"] == "min" and cand[m] > cur[m]:
-                return {"promoted": False, "reason": f"{m} did not improve: {cand[m]} vs current {cur[m]}", "candidate": cand, "current": cur}
+        reason = failing()
+        if reason:
+            self._revert_live(current)
+            return {"promoted": False, "reason": reason, "candidate": cand, "current": cur}
 
         defn = self.owl.get(f"/v1/systems/{self.sid}/definition", headers=self._owner_hdr()).json()
         lever = next(l for l in defn["levers"] if l["name"] == "build_version")

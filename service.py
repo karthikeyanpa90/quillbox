@@ -98,8 +98,11 @@ def make_app(adapter: QuillboxAdapter = None, sid: str = "", adapter_secret: str
         body = await _checked_body(request)
         return {"ok": ad.revert(body["version"], body["slice"])}
 
-    @app.post("/run-week/{week}")
-    def run_week(week: int, authorization: str = Header(default="")):
+    @app.post("/check-in/{n}")
+    def check_in(n: int, authorization: str = Header(default="")):
+        """n: a sequential index of real evaluation events (round 134) -- a routine check that
+        nothing has regressed, or one step of a candidate-promotion attempt. Never a calendar
+        week; renamed from /run-week once that was formally settled."""
         key = authorization[7:] if authorization.lower().startswith("bearer ") else ""
         if not driver_key or not hmac.compare_digest(key, driver_key):
             raise HTTPException(401, "not the onboarding driver")
@@ -112,8 +115,8 @@ def make_app(adapter: QuillboxAdapter = None, sid: str = "", adapter_secret: str
                 if not secret:
                     continue
                 owl.post(f"/v1/systems/{sid}/records/{measure}",
-                         json={"week": week, "age": 0, "rows": [{"unit": "quillbox", "value": report[measure]}],
-                               "secret": secret}).raise_for_status()
+                         json={"week": n, "age": 0, "rows": [{"unit": "quillbox", "value": report[measure]}],
+                               "secret": secret}).raise_for_status()   # "week" here is OWL's own field name (records endpoint), unrenamed -- out of scope
         return report
 
     @app.get("/status")

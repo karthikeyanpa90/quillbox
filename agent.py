@@ -72,7 +72,7 @@ class QuillAgent:
         self.week = 0
         self.qb = qb                          # httpx.Client on the real deployed Quillbox service
         self.adapter_secret = adapter_secret   # signs calls to qb's /apply and /revert, like OWL's own actuator would
-        self.driver_key = driver_key           # authorizes calls to qb's /run-week
+        self.driver_key = driver_key           # authorizes calls to qb's /check-in
 
     def register(self):
         r = self.owl.post("/v1/systems", json={"name": "quillbox-fast"}); r.raise_for_status()
@@ -131,17 +131,18 @@ class QuillAgent:
         r = self.qb.post("/revert", content=body, headers={"x-owl-signature": self._sign(body)}); r.raise_for_status()
         return r.json()
 
-    def _measure_live(self, week: int) -> dict:
+    def _measure_live(self, n: int) -> dict:
         """Whatever's currently applied on the real deployed adapter, measured for real via its own
-        /run-week -- which also delivers the reading to OWL as a real record, honestly, win or
-        lose, before this agent has decided anything."""
-        r = self.qb.post(f"/run-week/{week}", headers={"Authorization": "Bearer " + self.driver_key})
+        /check-in -- which also delivers the reading to OWL as a real record, honestly, win or
+        lose, before this agent has decided anything. n: a sequential check-in index (round 134),
+        never a calendar week."""
+        r = self.qb.post(f"/check-in/{n}", headers={"Authorization": "Bearer " + self.driver_key})
         r.raise_for_status(); report = r.json()
-        c = self.owl.post(f"/v1/systems/{self.sid}/cycle/{week}", headers=self._runtime_hdr()); c.raise_for_status()
-        self.week = week
+        c = self.owl.post(f"/v1/systems/{self.sid}/cycle/{n}", headers=self._runtime_hdr()); c.raise_for_status()
+        self.week = n
         return report
 
-    def promote_if_better(self, candidate: str, current: str, week: int) -> dict:
+    def promote_if_better(self, candidate: str, current: str, n: int) -> dict:
         """OWL's own trial mechanism can't confirm a gain here -- system F has one unit, so there
         is never a control group to compare against (round 132, instances/owl-build.md). Quill
         Agent's own job, not OWL's: apply the candidate for real on the live adapter, measure it
@@ -153,8 +154,8 @@ class QuillAgent:
         registered the very first version, not a new mechanism. If it doesn't clear the bar, it's
         reverted back to the current version on the live adapter, and OWL's Definition is never
         touched at all."""
-        self._apply_live(current); cur = self._measure_live(week)
-        self._apply_live(candidate); cand = self._measure_live(week + 1)
+        self._apply_live(current); cur = self._measure_live(n)
+        self._apply_live(candidate); cand = self._measure_live(n + 1)
 
         def failing():
             for g in DEF["guards"]:

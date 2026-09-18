@@ -5,3 +5,4 @@ __pycache__/
 .pytest_report.json
 .coverage_report.json
 .pytest_cache/
+.coverage

@@ -95,6 +95,22 @@ class QuillAgent:
         self.week = week
         return {"week": week, "report": report, "cycle": r.json()}
 
+    def register_adapter(self, base_url: str):
+        r = self.owl.post(f"/v1/systems/{self.sid}/adapter", json={"base_url": base_url}, headers=self._owner_hdr())
+        r.raise_for_status()
+        return r.json()["secret"]
+
+    def grow_build_version(self, new_option: str):
+        """A pure addition to the choice lever (lever_growth, owl/core/definition.py): every
+        prior option's own measured state survives untouched, only the new one gets a start."""
+        defn = self.owl.get(f"/v1/systems/{self.sid}/definition", headers=self._owner_hdr()).json()
+        lever = next(l for l in defn["levers"] if l["name"] == "build_version")
+        if new_option not in lever["options"]:
+            lever["options"] = lever["options"] + [new_option]
+        r = self.owl.put(f"/v1/systems/{self.sid}/definition", json=defn, headers=self._owner_hdr())
+        r.raise_for_status()
+        return r.json()
+
     def next_target(self) -> dict:
         """What's currently unmet or unclimbed, read from status -- not an instruction OWL gives,
         a decision this agent makes from what it reads (round 130's pushback #2)."""

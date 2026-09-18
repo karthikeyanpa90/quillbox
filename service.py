@@ -12,11 +12,14 @@ import hmac
 import json
 import os
 import shutil
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from starlette.concurrency import run_in_threadpool
 
 from witness import witness_report
 
@@ -40,6 +43,18 @@ class QuillboxAdapter:
     def __init__(self):
         self.live_version = "v0"
         self.applies = []
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def exclusive(self, wait_seconds: float = 30.0):
+        """One operation on quillbox_app/ at a time (P42): apply/revert swap the files with a non-atomic
+        rmtree+copytree, and a check-in measures them, so without this a measurement could read half-swapped
+        code. Callers queue rather than fail -- OWL's actuator treats a 409 as an unverified apply and does not
+        retry it -- and only a caller still waiting after `wait_seconds` is refused."""
+        if not self._lock.acquire(timeout=wait_seconds):
+            raise HTTPException(409, "quillbox is busy with another apply, revert or check-in; try again shortly")
+        try: yield
+        finally: self._lock.release()
 
     def _candidate_dir(self, name: str) -> Path:
         d = CANDIDATES / name / "quillbox_app"
@@ -83,20 +98,23 @@ def make_app(adapter: QuillboxAdapter = None, sid: str = "", adapter_secret: str
             raise HTTPException(401, "bad signature: this call did not come from OWL")
         return await request.json()
 
+    def _exclusively(fn, *args):
+        with ad.exclusive(): return fn(*args)
+
     @app.post("/apply")
     async def apply(request: Request):
-        body = await _checked_body(request)
-        return {"ok": ad.apply(body["version"], body["slice"])}
+        body = await _checked_body(request)            # the lock is waited on in the threadpool, never on the event loop
+        return {"ok": await run_in_threadpool(_exclusively, ad.apply, body["version"], body["slice"])}
 
     @app.post("/verify")
     async def verify(request: Request):
         body = await _checked_body(request)
-        return {"ok": ad.verify(body["version"], body["slice"])}
+        return {"ok": await run_in_threadpool(_exclusively, ad.verify, body["version"], body["slice"])}
 
     @app.post("/revert")
     async def revert(request: Request):
         body = await _checked_body(request)
-        return {"ok": ad.revert(body["version"], body["slice"])}
+        return {"ok": await run_in_threadpool(_exclusively, ad.revert, body["version"], body["slice"])}
 
     @app.post("/check-in/{n}")
     def check_in(n: int, authorization: str = Header(default="")):
@@ -106,7 +124,8 @@ def make_app(adapter: QuillboxAdapter = None, sid: str = "", adapter_secret: str
         key = authorization[7:] if authorization.lower().startswith("bearer ") else ""
         if not driver_key or not hmac.compare_digest(key, driver_key):
             raise HTTPException(401, "not the onboarding driver")
-        report = witness_report()
+        with ad.exclusive():                                # the files can't be swapped mid-measurement (P42)
+            report = witness_report()
         owl_base = os.environ.get("QB_OWL_BASE_URL", "")
         if owl_base and sid:
             owl = httpx.Client(base_url=owl_base, timeout=20.0)

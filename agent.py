@@ -51,8 +51,11 @@ DEF = dict(
     # candidate that genuinely clears every guard and improves the goal still needs the sequential
     # judge's confirm step to run across an actual window, structurally, independent of noise --
     # patience=1 was never the limiting factor. 8 matches every other tenant's own convention.
+    # slice_share=10 ("always everyone", rounds 129/131) is refused since round 136 (P36): it leaves no control
+    # group. It never mattered for system F -- one build_version option means OWL never trials it, and since
+    # round 135 a step that changes nothing isn't a trial at all -- so any valid value serves.
     theta=dict(cycle=1, minimum_effect=0.0, quantile=0.5, plausibility_bound=1.0, max_horizon=8,
-               slice_share=10, spillover_bound=10, pre_period_weeks=0, auto_approve=True,
+               slice_share=5, spillover_bound=6, pre_period_weeks=0, auto_approve=True,
                proposer="lever_map", random_share=0.0, patience=8, sequential=True),
 )
 

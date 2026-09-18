@@ -1,0 +1,7 @@
+.venv/
+.deploy-env.yaml
+__pycache__/
+*.pyc
+.pytest_report.json
+.coverage_report.json
+.pytest_cache/

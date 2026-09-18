@@ -11,7 +11,10 @@ calls the OWL API. Holds both of system F's keys. Its job, each time a candidate
      (round 130's pushback #2); that choice is this file's own, not read off OWL
 """
 import json
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 DEF = dict(
     name="quillbox-fast",
@@ -22,12 +25,16 @@ DEF = dict(
         dict(name="build_version", kind="choice", options=["v0"], start="v0", cls="code", blast_per_step=1),
     ],
     measures=[
+        # compliance_pass listed first: unit_scale() (owl/core/definition.py) divides every other
+        # measure's threshold by measures[0].base, so it can never be 0 -- found live (round 131/132)
+        # when every measure here was left at its honest current reading of 0. 1.0 is the natural
+        # reference for a share expected to fully hold, not a claim about what's currently measured.
+        dict(name="compliance_pass", label="compliance checks passing", unit="share of required checks passing",
+             base=1.0, kind="share", witness=dict(kind="compliance_scanner", description="the unsubscribe-link AST scan")),
         dict(name="critical_defects", label="critical static-analysis findings", unit="count",
              base=0, kind="sum", witness=dict(kind="sast_scanner", description="pyflakes, run against the candidate")),
         dict(name="coverage", label="test coverage", unit="share of lines covered", base=0.0,
              kind="share", witness=dict(kind="ci_pipeline", description="pytest-cov's own report")),
-        dict(name="compliance_pass", label="compliance checks passing", unit="share of required checks passing",
-             base=0.0, kind="share", witness=dict(kind="compliance_scanner", description="the unsubscribe-link AST scan")),
         dict(name="story_completion", label="user stories completed", unit="share of acceptance tests passing",
              base=0.0, kind="share", witness=dict(kind="acceptance_test_runner", description="pytest, tests named test_story_*")),
     ],
@@ -41,9 +48,13 @@ DEF = dict(
     ],
     levers_for=dict(story_completion=["build_version"], coverage=["build_version"],
                      compliance_pass=["build_version"], critical_defects=["build_version"]),
-    theta=dict(cycle=1, minimum_effect=0.0, quantile=0.5, plausibility_bound=1.0, max_horizon=1,
+    # max_horizon=1 (round 129/131's first guess) turned out wrong in practice, round 132: a real
+    # candidate that genuinely clears every guard and improves the goal still needs the sequential
+    # judge's confirm step to run across an actual window, structurally, independent of noise --
+    # patience=1 was never the limiting factor. 8 matches every other tenant's own convention.
+    theta=dict(cycle=1, minimum_effect=0.0, quantile=0.5, plausibility_bound=1.0, max_horizon=8,
                slice_share=10, spillover_bound=10, pre_period_weeks=0, auto_approve=True,
-               proposer="lever_map", random_share=0.0, patience=1, sequential=True),
+               proposer="lever_map", random_share=0.0, patience=8, sequential=True),
 )
 
 
@@ -100,16 +111,47 @@ class QuillAgent:
         r.raise_for_status()
         return r.json()["secret"]
 
-    def grow_build_version(self, new_option: str):
-        """A pure addition to the choice lever (lever_growth, owl/core/definition.py): every
-        prior option's own measured state survives untouched, only the new one gets a start."""
+    def evaluate_candidate(self, name: str) -> dict:
+        """Real witness numbers for a candidate, entirely offline -- never touches OWL or the live
+        deployed adapter. Runs as its own subprocess (evaluate_candidate.py) so nothing about a
+        previous import ever leaks in, the same lesson witness.py's compliance_scan already learned
+        the hard way (round 132)."""
+        r = subprocess.run([sys.executable, str(Path(__file__).parent / "evaluate_candidate.py"), name],
+                            capture_output=True, text=True)
+        r.check_returncode()
+        return json.loads(r.stdout)
+
+    def promote_if_better(self, candidate: str, current: str) -> dict:
+        """OWL's own trial mechanism can't confirm a gain here -- system F has one unit, so there
+        is never a control group to compare against (round 132, instances/owl-build.md). Quill
+        Agent's own job, not OWL's: evaluate both versions for real, offline, and if the candidate
+        clears every guard and is at least as good on every goal as the current version, promote
+        it by replacing build_version's sole option -- the exact PUT /definition call that
+        registered the very first version, not a new mechanism (round 133). If it doesn't clear
+        the bar, OWL is never touched at all."""
+        cand = self.evaluate_candidate(candidate)
+        cur = self.evaluate_candidate(current)
+
+        for g in DEF["guards"]:
+            m, limit, rule = g["measure"], g["limit"], g["rule"]
+            if rule == "max" and cand[m] > limit:
+                return {"promoted": False, "reason": f"{m}={cand[m]} exceeds guard max {limit}", "candidate": cand, "current": cur}
+            if rule == "min" and cand[m] < limit:
+                return {"promoted": False, "reason": f"{m}={cand[m]} below guard min {limit}", "candidate": cand, "current": cur}
+
+        for r in DEF["goal"]:
+            m = r["measure"]
+            if r["rel"] == "max" and cand[m] < cur[m]:
+                return {"promoted": False, "reason": f"{m} did not improve: {cand[m]} vs current {cur[m]}", "candidate": cand, "current": cur}
+            if r["rel"] == "min" and cand[m] > cur[m]:
+                return {"promoted": False, "reason": f"{m} did not improve: {cand[m]} vs current {cur[m]}", "candidate": cand, "current": cur}
+
         defn = self.owl.get(f"/v1/systems/{self.sid}/definition", headers=self._owner_hdr()).json()
         lever = next(l for l in defn["levers"] if l["name"] == "build_version")
-        if new_option not in lever["options"]:
-            lever["options"] = lever["options"] + [new_option]
-        r = self.owl.put(f"/v1/systems/{self.sid}/definition", json=defn, headers=self._owner_hdr())
-        r.raise_for_status()
-        return r.json()
+        lever["options"] = [candidate]; lever["start"] = candidate
+        put = self.owl.put(f"/v1/systems/{self.sid}/definition", json=defn, headers=self._owner_hdr())
+        put.raise_for_status()
+        return {"promoted": True, "candidate": cand, "current": cur, "owl_response": put.json()}
 
     def next_target(self) -> dict:
         """What's currently unmet or unclimbed, read from status -- not an instruction OWL gives,

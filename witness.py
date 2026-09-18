@@ -5,7 +5,6 @@ here is fabricated or simulated -- each is read from a real tool's real output a
 code is actually checked out as the current candidate.
 """
 import ast
-import inspect
 import json
 import re
 import subprocess
@@ -46,15 +45,12 @@ def run_defect_scan() -> dict:
     return {"critical_defects": len(findings), "findings": findings}
 
 
-def _references_name_in_body(fn, name: str) -> bool:
+def _references_name_in_body(fn_node: ast.FunctionDef, name: str) -> bool:
     """An AST check, not a substring match on raw source: only a real ast.Name use inside the
     function's executable body counts. A substring check would pass on the constant's name typed
     into a comment or a docstring -- exactly the shallow, gameable check C1 rules out for a real
-    witness (found live: the docstring below originally named UNSUBSCRIBE_URL itself and a naive
-    substring check passed on that alone, with the constant never actually used)."""
-    src = inspect.getsource(fn)
-    tree = ast.parse(src.strip())
-    fn_node = tree.body[0]
+    witness (found live, round 131: the docstring below originally named UNSUBSCRIBE_URL itself and
+    a naive substring check passed on that alone, with the constant never actually used)."""
     body = fn_node.body
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
         body = body[1:]                                            # skip the docstring statement itself
@@ -64,12 +60,22 @@ def _references_name_in_body(fn, name: str) -> bool:
 def compliance_scan() -> dict:
     """The one compliance rule from round 129/130: every function named send_* must actually use
     UNSUBSCRIBE_URL in its own body, not merely mention it. Vacuously compliant (1.0) if no send_*
-    function exists yet -- nothing sends, so nothing can violate the rule; noted, not hidden."""
-    import quillbox_app.main as m
-    send_fns = [(name, obj) for name, obj in vars(m).items() if name.startswith("send_") and inspect.isfunction(obj)]
+    function exists yet -- nothing sends, so nothing can violate the rule; noted, not hidden.
+
+    Parses quillbox_app/main.py straight off disk -- not `import quillbox_app.main` -- on purpose.
+    Found live, round 132: apply()'s shutil.copytree swaps real files on disk, but this process's
+    `sys.modules` cache doesn't know that -- a long-running server that imports the module once and
+    inspects the live function object keeps seeing whichever candidate happened to be on disk at
+    the moment of the *first* import, not the one actually applied. A real static scanner reads
+    source text, it doesn't introspect an already-imported object; doing the same here means every
+    call reflects exactly whatever's on disk right now, matching what pytest's own subprocess calls
+    already correctly do."""
+    src_path = ROOT / "quillbox_app" / "main.py"
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
+    send_fns = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name.startswith("send_")]
     if not send_fns:
         return {"compliance_pass": 1.0, "checked": 0, "note": "vacuous: no send_* function exists yet"}
-    violations = [name for name, fn in send_fns if not _references_name_in_body(fn, "UNSUBSCRIBE_URL")]
+    violations = [n.name for n in send_fns if not _references_name_in_body(n, "UNSUBSCRIBE_URL")]
     return {"compliance_pass": 1.0 - (len(violations) / len(send_fns)), "checked": len(send_fns), "violations": violations}
 
 

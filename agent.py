@@ -73,9 +73,16 @@ DEF = dict(
                proposer="lever_map", random_share=0.0, patience=8, sequential=True),
 )
 
-JUDGED = ("compliance_pass", "critical_defects", "coverage", "story_completion")
-SHOWN_ONLY = ("story_tests_total",)
-MEASURES = JUDGED + SHOWN_ONLY
+# Round 141 (P49) split these by what it takes to obtain them, which turned out to be the line that decides
+# whether a number can be judged at all. The two guards are read off the candidate's source without running it;
+# nothing in the candidate can act while they are measured. The rest need the candidate to execute, and the
+# executing code writes the very files those numbers are read from -- reproduced, not argued. Until there is a
+# measurement of them taken from outside the running code, no provider for them is independent of them, and
+# nothing delivers them: the keys their connectors name were generated and discarded unused.
+STATIC = ("compliance_pass", "critical_defects")
+AWAITING_PROVIDER = ("coverage", "story_completion", "story_tests_total")
+JUDGED = STATIC + ("coverage", "story_completion")
+MEASURES = STATIC + AWAITING_PROVIDER
 
 
 class NotIndependent(Exception):
@@ -128,7 +135,7 @@ class QuillAgent:
         provider declared independent, and be about the candidate that was asked for -- otherwise this is not
         evidence and nothing is decided on it."""
         out = {}
-        for m in MEASURES:
+        for m in STATIC:
             r = self.owl.get(f"/v1/systems/{self.sid}/records/{m}?week={index}", headers=self._owner_hdr())
             r.raise_for_status(); rows = r.json()
             if not rows:
@@ -166,7 +173,14 @@ class QuillAgent:
         touched at all.
 
         Both measurements are delivered to OWL by the witness, honestly, win or lose, before anything is decided
-        -- and this method reads them back out of OWL rather than trusting what the witness printed."""
+        -- and this method reads them back out of OWL rather than trusting what the witness printed.
+
+        Round 141 stopped this short of promoting anything. Both goal rows -- story_completion and coverage --
+        can only be obtained by running the candidate, and the running candidate writes the files those numbers
+        are read from, so no provider for them is independent of them. The guards can still be checked, and are,
+        on readings that hold up; the climb cannot. That is the ratchet working rather than failing: a system
+        with no trustworthy reading of what it is climbing towards does not climb. Restoring it needs a
+        measurement taken from outside the running code (P49), not a flag."""
         self._apply_live(current); cur = self.measure(current, n)
         self._apply_live(candidate); cand = self.measure(candidate, n + 1)
 
@@ -175,17 +189,9 @@ class QuillAgent:
                 m, limit, rule = g["measure"], g["limit"], g["rule"]
                 if rule == "max" and cand[m] > limit: return f"{m}={cand[m]} exceeds guard max {limit}"
                 if rule == "min" and cand[m] < limit: return f"{m}={cand[m]} below guard min {limit}"
-            for r in DEF["goal"]:
-                m = r["measure"]
-                if r["rel"] == "max" and cand[m] < cur[m]: return f"{m} did not improve: {cand[m]} vs current {cur[m]}"
-                if r["rel"] == "min" and cand[m] > cur[m]: return f"{m} did not improve: {cand[m]} vs current {cur[m]}"
-            if cand["story_tests_total"] < cur["story_tests_total"]:
-                # Shown, never judged -- so OWL will not refuse this, and Quill Agent must. story_completion is a
-                # share of the acceptance suite, and a candidate that deletes a failing story raises it without
-                # building anything: round 140's cheapest attack on system F's own measure.
-                return (f"the acceptance suite shrank: {cand['story_tests_total']} stories against "
-                        f"{cur['story_tests_total']} -- story_completion is not comparable across a changed rubric")
-            return None
+            return ("every guard holds, but no goal row can be judged: " + ", ".join(AWAITING_PROVIDER) +
+                    " are obtained by running the candidate, and the running candidate writes the files they are "
+                    "read from, so nothing delivers them (P49). Not promoted.")
 
         reason = failing()
         if reason:

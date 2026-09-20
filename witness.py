@@ -12,6 +12,7 @@ no longer assume the directory they measure is the one they live in.
 """
 import ast
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,13 +21,22 @@ HERE = Path(__file__).parent
 
 
 def _run(args, root: Path, as_user: str = None):
-    """Every tool runs as a subprocess against `root`. `as_user` drops to an unprivileged account first, where the
-    platform allows it: pytest executes the candidate's own code, and that code must not run as the identity that
-    can read the provider's signing key."""
+    """Every tool runs as a subprocess against `root`.
+
+    PYTHONSAFEPATH is not optional. `python -m pyflakes` puts the working directory at the front of sys.path, and
+    the working directory is the staged candidate: a directory named `pyflakes/` sitting there shadows the real
+    tool entirely. Reproduced, round 141 -- a two-line package silenced the defect scan and returned a clean
+    report. PYTHONSAFEPATH=1 stops the interpreter prepending the directory, and the real tool is found again.
+    PYTHONDONTWRITEBYTECODE keeps the staged tree free of __pycache__ so it can be re-digested afterwards.
+
+    `as_user` drops to an unprivileged account where the platform allows it. That is hardening, not a boundary:
+    it does not stop the candidate reading anything world-readable in the same container, which is why the keys
+    live in a different job now."""
     kwargs = {}
     if as_user:
         kwargs["user"] = as_user                                   # POSIX only; witness_job.py decides whether to pass one
-    return subprocess.run(args, cwd=root, capture_output=True, text=True, **kwargs)
+    env = dict(os.environ, PYTHONSAFEPATH="1", PYTHONDONTWRITEBYTECODE="1")
+    return subprocess.run(args, cwd=root, capture_output=True, text=True, env=env, **kwargs)
 
 
 def run_tests_and_coverage(root: Path = HERE, as_user: str = None) -> dict:
@@ -89,17 +99,36 @@ def compliance_scan(root: Path = HERE) -> dict:
     return {"compliance_pass": 1.0 - (len(violations) / len(send_fns)), "checked": len(send_fns), "violations": violations}
 
 
-def witness_report(root: Path = HERE, as_user: str = None) -> dict:
+def static_report(root: Path = HERE, as_user: str = None) -> dict:
+    """The two measures that read the candidate's source without ever running it: pyflakes and the AST compliance
+    scan. Both back a guard. Nothing here imports, executes or evaluates a line of the code being measured, so
+    nothing the candidate contains can act while they run -- which is what lets them be judged (round 141)."""
     root = Path(root)
-    tc = run_tests_and_coverage(root, as_user)
     df = run_defect_scan(root, as_user)
     cs = compliance_scan(root)
-    return {
-        "story_completion": tc["story_completion"], "coverage": tc["coverage"],
-        "critical_defects": df["critical_defects"], "compliance_pass": cs["compliance_pass"],
-        "story_tests_total": tc["story_tests_total"],
-        "detail": {"tests": tc, "defects": df, "compliance": cs},
-    }
+    return {"critical_defects": df["critical_defects"], "compliance_pass": cs["compliance_pass"],
+            "detail": {"defects": df, "compliance": cs}}
+
+
+def dynamic_report(root: Path = HERE, as_user: str = None) -> dict:
+    """The measures that require running the candidate: pytest for the acceptance suite and coverage.py for
+    coverage. These cannot be made independent of the thing they measure by running them somewhere else -- the
+    code under test is executing, and it writes the very files these numbers are read from. Round 141 reproduced
+    that end to end. They are produced in a job that holds no key and signs nothing."""
+    root = Path(root)
+    tc = run_tests_and_coverage(root, as_user)
+    return {"story_completion": tc["story_completion"], "coverage": tc["coverage"],
+            "story_tests_total": tc["story_tests_total"], "detail": {"tests": tc}}
+
+
+def witness_report(root: Path = HERE, as_user: str = None) -> dict:
+    """Both halves together. Only useful for a person looking at a candidate by hand -- the live witness never
+    runs this, because running the dynamic half next to a signing key is exactly what round 141 removed."""
+    root = Path(root)
+    st = static_report(root, as_user)
+    dy = dynamic_report(root, as_user)
+    return dict(st, **{k: v for k, v in dy.items() if k != "detail"},
+                detail=dict(st["detail"], **dy["detail"]))
 
 
 if __name__ == "__main__":

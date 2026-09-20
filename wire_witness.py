@@ -28,13 +28,13 @@ import truststore  # noqa: E402
 truststore.inject_into_ssl()
 import httpx  # noqa: E402
 
-from agent import DEF, JUDGED, SHOWN_ONLY  # noqa: E402
+from agent import DEF, STATIC, AWAITING_PROVIDER  # noqa: E402
 from qb_env import read_env  # noqa: E402
 from qb_signing import new_keypair  # noqa: E402
 
 PROJECT = "acresgo-prod"
 SECRET = "QB_WITNESS_KEYS"
-MEASURES = JUDGED + SHOWN_ONLY
+MEASURES = STATIC + AWAITING_PROVIDER
 KINDS = {"compliance_pass": "compliance_scanner", "critical_defects": "sast_scanner", "coverage": "ci_pipeline",
          "story_completion": "acceptance_test_runner", "story_tests_total": "acceptance_test_runner"}
 PUBLIC_FILE = r"C:\acresgo\quillbox\witness-public-keys.json"     # committed: public halves only, so anyone can check
@@ -51,16 +51,23 @@ def gcloud(args, stdin: str = None):
 
 
 def make_keys():
+    """Round 141: only the two static measures get a private key that is kept. The three that need the candidate
+    to run have no provider that is independent of them (P49), so their key pairs are generated, their public
+    halves registered, and their private halves discarded here and now -- nothing can deliver those measures
+    until there is a way to measure them from outside the running code. That is a deliberate freeze, not an
+    oversight, and it is the reason the measures still appear in the Definition with no readings arriving."""
     pairs = {m: new_keypair() for m in MEASURES}
-    private = {m: priv for m, (priv, _) in pairs.items()}
+    private = {m: priv for m, (priv, _) in pairs.items() if m in STATIC}
     public = {m: pub for m, (_, pub) in pairs.items()}
+    del pairs
     exists = subprocess.run([GCLOUD, "secrets", "describe", SECRET, "--project", PROJECT],
                             capture_output=True, text=True).returncode == 0
     args = ["secrets", "versions", "add", SECRET] if exists else ["secrets", "create", SECRET]
     gcloud(args + ["--project", PROJECT, "--data-file=-"], stdin=json.dumps(private))
     with open(PUBLIC_FILE, "w", encoding="utf-8") as f:
         json.dump(public, f, indent=2, sort_keys=True)
-    print(f"{'new version of' if exists else 'created'} secret {SECRET} in {PROJECT} ({len(private)} keys)")
+    print(f"{'new version of' if exists else 'created'} secret {SECRET} in {PROJECT} ({len(private)} keys kept: "
+          f"{', '.join(sorted(private))}; discarded unused: {', '.join(sorted(AWAITING_PROVIDER))})")
     print(f"wrote {PUBLIC_FILE} -- public halves only; the private halves are in Secret Manager and nowhere else")
 
 

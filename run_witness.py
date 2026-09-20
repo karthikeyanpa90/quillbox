@@ -8,17 +8,19 @@ the job to OWL over the job's own signature, and Quill Agent reads them back out
 A failed execution raises. That is deliberate: a measurement that did not happen must not be mistaken for one
 that happened and said nothing, and Quill Agent's read-back would then find no reading and refuse anyway.
 """
+import shutil
 import subprocess
 
 PROJECT = "acresgo-prod"
 REGION = "asia-south1"
 JOB = "job-quillbox-witness"
+GCLOUD = shutil.which("gcloud") or "gcloud"       # on Windows the real entry point is gcloud.cmd
 
 
 def cloud_run_witness(version: str, index: int, project: str = PROJECT, region: str = REGION, job: str = JOB):
     """`gcloud run jobs execute --wait` with the two per-run values as environment overrides. Everything else --
     the system id, OWL's address, the mounted key file -- is fixed on the job itself, not passed in here."""
-    cmd = ["gcloud", "run", "jobs", "execute", job, "--project", project, "--region", region, "--wait",
+    cmd = [GCLOUD, "run", "jobs", "execute", job, "--project", project, "--region", region, "--wait",
            "--update-env-vars", f"QB_VERSION={version},QB_INDEX={index}"]
     r = subprocess.run(cmd, capture_output=True, text=True, shell=False)
     if r.returncode != 0:

@@ -18,6 +18,7 @@ Order matters, and the order is not reversible:
 Usage:  .venv/Scripts/python.exe wire_witness.py keys|define|register|show
 """
 import json
+import shutil
 import subprocess
 import sys
 
@@ -39,8 +40,11 @@ KINDS = {"compliance_pass": "compliance_scanner", "critical_defects": "sast_scan
 PUBLIC_FILE = r"C:\acresgo\quillbox\witness-public-keys.json"     # committed: public halves only, so anyone can check
 
 
+GCLOUD = shutil.which("gcloud") or "gcloud"       # on Windows the real entry point is gcloud.cmd, not gcloud
+
+
 def gcloud(args, stdin: str = None):
-    r = subprocess.run(["gcloud"] + args, capture_output=True, text=True, input=stdin)
+    r = subprocess.run([GCLOUD] + args, capture_output=True, text=True, input=stdin)
     if r.returncode != 0:
         raise SystemExit(f"gcloud {' '.join(args[:3])} failed:\n{r.stderr.strip()}")
     return r.stdout.strip()
@@ -50,7 +54,7 @@ def make_keys():
     pairs = {m: new_keypair() for m in MEASURES}
     private = {m: priv for m, (priv, _) in pairs.items()}
     public = {m: pub for m, (_, pub) in pairs.items()}
-    exists = subprocess.run(["gcloud", "secrets", "describe", SECRET, "--project", PROJECT],
+    exists = subprocess.run([GCLOUD, "secrets", "describe", SECRET, "--project", PROJECT],
                             capture_output=True, text=True).returncode == 0
     args = ["secrets", "versions", "add", SECRET] if exists else ["secrets", "create", SECRET]
     gcloud(args + ["--project", PROJECT, "--data-file=-"], stdin=json.dumps(private))
@@ -65,8 +69,22 @@ def owl_client(env):
 
 
 def define():
+    """Add story_tests_total to the live Definition, keeping the live lever exactly as it is.
+
+    DEF in agent.py is the *original* Definition, and its build_version lever still says v0 -- every promotion
+    since has moved it by replacing that lever's options, which is the whole promotion mechanism here (round
+    132). PUTting DEF verbatim therefore silently demotes the system to v0 and, because the levers then differ
+    from the stored ones, resets OWL's loop state. Done live, round 140, on the real system: the Definition went
+    back to v0 while the adapter was serving v1, and week 21 with counts {keep 0, revert 3} was wiped. The ledger
+    was untouched -- it is append-only, and both the promotion and the accident are on it -- but the loop's own
+    state does not come back. So the live lever wins, and only the measures change."""
     env = read_env(); owl, owner = owl_client(env)
-    r = owl.put(f"/v1/systems/{env['QB_SID']}/definition", json=DEF, headers=owner)
+    live = owl.get(f"/v1/systems/{env['QB_SID']}/definition", headers=owner).json()
+    new = dict(DEF, levers=live["levers"]) if live.get("levers") else dict(DEF)
+    same = live.get("levers") == new["levers"]
+    print(f"keeping the live lever: {json.dumps(new['levers'][0].get('options'))} "
+          f"start={new['levers'][0].get('start')!r} -- {'no state reset' if same else 'THIS WILL RESET THE LOOP STATE'}")
+    r = owl.put(f"/v1/systems/{env['QB_SID']}/definition", json=new, headers=owner)
     r.raise_for_status()
     print(f"definition accepted: {r.json()}")
 

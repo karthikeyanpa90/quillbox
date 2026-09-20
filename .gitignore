@@ -6,4 +6,3 @@ __pycache__/
 .coverage_report.json
 .pytest_cache/
 .coverage
-deploy_command.txt

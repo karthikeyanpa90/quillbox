@@ -119,6 +119,12 @@ def main() -> int:
     about = dict(provenance, build_version=version, index=index,
                  witness="job-quillbox-witness" if mode == "static" else "job-quillbox-measure",
                  image=os.environ.get("QB_IMAGE", "unknown"))
+    if mode == "static":
+        # How much was looked at, on the record (round 142). Both guards used to be indistinguishable from a
+        # scan that found nothing because it never ran or never looked in the right file; the counts make a
+        # vacuous pass visible to anyone reading the reading.
+        about["compliance_checked"] = report["checked"]
+        about["files_scanned"] = report["files_scanned"]
 
     if mode == "dynamic":
         # Holds no key, signs nothing, delivers nothing. These numbers come from a process running the candidate's

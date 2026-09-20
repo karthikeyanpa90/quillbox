@@ -40,16 +40,25 @@ iam () {
   done
   gcloud secrets add-iam-policy-binding "$SECRET" --project "$PROJECT" \
     --member "serviceAccount:$WITNESS_SA" --role roles/secretmanager.secretAccessor >/dev/null
-  echo "qb-app and qb-measure: no roles. qb-witness: secretAccessor on $SECRET only."
+  for s in QB_ADAPTER_SECRET QB_PROPOSER_TOKEN; do
+    gcloud secrets add-iam-policy-binding "$s" --project "$PROJECT" \
+      --member "serviceAccount:$APP_SA" --role roles/secretmanager.secretAccessor >/dev/null 2>&1 || true
+  done
+  echo "qb-measure: no roles. qb-witness: $SECRET only. qb-app: its own two secrets only."
 }
 
 build () { ( cd "$ROOT" && gcloud builds submit --project "$PROJECT" --tag "$IMG:latest" . ); }
 
 service () {
-  # --clear-secrets and an explicit --set-env-vars: the point of this deploy is what is NOT here.
+  # The point of this deploy is what is NOT here. Round 142: the two credentials it still needs are Secret
+  # Manager references, not plain values -- `gcloud run services describe` hands a plain value to anything
+  # holding run.services.get, which in this project includes three other graded tenants' runtime identity. And
+  # the runtime key is gone: it is admitted on POST /cycle, so the graded application could advance the judge's
+  # clock. The proposer token can read status and, on a one-option lever, propose nothing.
   gcloud run services update "$SERVICE" --project "$PROJECT" --region "$REGION" \
-    --image "$IMG:latest" --service-account "$APP_SA" --clear-secrets \
-    --set-env-vars "QB_SID=$(env_of QB_SID),QB_RUNTIME_KEY=$(env_of QB_RUNTIME_KEY),QB_ADAPTER_SECRET=$(env_of QB_ADAPTER_SECRET),QB_OWL_BASE_URL=$OWL_BASE"
+    --image "$IMG:latest" --service-account "$APP_SA" \
+    --set-secrets "QB_ADAPTER_SECRET=QB_ADAPTER_SECRET:latest,QB_PROPOSER_TOKEN=QB_PROPOSER_TOKEN:latest" \
+    --set-env-vars "QB_SID=$(env_of QB_SID),QB_OWL_BASE_URL=$OWL_BASE"
   echo "adapter live: $(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')"
 }
 

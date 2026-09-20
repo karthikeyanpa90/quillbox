@@ -17,7 +17,14 @@ Round 140 (P46) took four things out of this file and did not put anything back:
 What is left is what an adapter is for: apply a version, say whether it took, revert it. The one credential it
 holds is the adapter secret, which only proves an inbound call came from OWL.
 
-Configured from the environment:  QB_SID, QB_ADAPTER_SECRET, QB_OWL_BASE_URL, QB_RUNTIME_KEY
+Round 142 took one more thing away. It held QB_RUNTIME_KEY, only ever used to ask OWL what is live at startup
+-- but the runtime role is admitted on `POST /cycle/{week}` and `POST /suggestions`, so the graded application
+could advance the judge's clock and choose which weeks entered its windows. It now holds the proposer token
+instead: enough to read status, and `submit_proposal` refuses a version that changes nothing, which is every
+version of a one-option lever. Both it and the adapter secret are Secret Manager references now, not plain
+values that `gcloud run services describe` hands to anything with run.services.get.
+
+Configured from the environment:  QB_SID, QB_ADAPTER_SECRET, QB_OWL_BASE_URL, QB_PROPOSER_TOKEN
 """
 import hashlib
 import hmac
@@ -141,19 +148,19 @@ def make_app(adapter: QuillboxAdapter = None, sid: str = "", adapter_secret: str
 def build_app_from_env() -> FastAPI:
     sid = os.environ.get("QB_SID", "")
     ad = QuillboxAdapter()
-    sync_from_owl(ad, sid, os.environ.get("QB_OWL_BASE_URL", ""), os.environ.get("QB_RUNTIME_KEY", ""))
+    sync_from_owl(ad, sid, os.environ.get("QB_OWL_BASE_URL", ""), os.environ.get("QB_PROPOSER_TOKEN", ""))
     return make_app(ad, sid=sid, adapter_secret=os.environ.get("QB_ADAPTER_SECRET", ""))
 
 
-def sync_from_owl(ad: QuillboxAdapter, sid: str, owl_base: str, runtime_key: str):
+def sync_from_owl(ad: QuillboxAdapter, sid: str, owl_base: str, read_token: str):
     """A fresh container boots on whatever candidate is baked into the image (v0), while OWL's ledger says what
     was actually promoted. Found live, round 136: after a redeploy, check-ins measured v0 while OWL held v1 live.
     So at startup, ask OWL what's live and apply it -- the same thing every other tenant here does on a cold
     start. If OWL can't be reached, stay on the baked-in version and say so on /status, rather than guess."""
     ad.synced = False
-    if not (owl_base and sid and runtime_key): return
+    if not (owl_base and sid and read_token): return
     try:
-        r = httpx.get(f"{owl_base}/v1/systems/{sid}", headers={"Authorization": "Bearer " + runtime_key}, timeout=15.0)
+        r = httpx.get(f"{owl_base}/v1/systems/{sid}", headers={"Authorization": "Bearer " + read_token}, timeout=15.0)
         live = ((r.json() or {}).get("x") or {}).get("build_version") if r.status_code == 200 else None
         if live and live != ad.live_version and (CANDIDATES / live / "quillbox_app").exists():
             ad.apply({"build_version": live}, {"everyone": True})

@@ -64,10 +64,18 @@ def run_tests_and_coverage(root: Path = HERE, as_user: str = None) -> dict:
 
 
 def run_defect_scan(root: Path = HERE, as_user: str = None) -> dict:
-    """pyflakes: real static analysis, not a mock -- unused imports, undefined names, the usual."""
+    """pyflakes: real static analysis, not a mock -- unused imports, undefined names, the usual.
+
+    It fails closed (round 142). pyflakes exits 0 when it finds nothing and 1 when it finds something; anything
+    else means the tool did not run, and counting the lines it did not print would score a perfect 0 against a
+    guard whose rule is `max 0`. A scan that did not happen is not a clean scan, so it raises rather than
+    returning the best possible number."""
     r = _run([sys.executable, "-m", "pyflakes", "quillbox_app"], root, as_user)
+    if r.returncode not in (0, 1):
+        raise RuntimeError(f"pyflakes did not run (exit {r.returncode}): {(r.stderr or r.stdout).strip()[:400]}")
     findings = [line for line in r.stdout.splitlines() if line.strip()]
-    return {"critical_defects": len(findings), "findings": findings}
+    files = len([f for f in (root / "quillbox_app").rglob("*.py") if "__pycache__" not in f.parts])
+    return {"critical_defects": len(findings), "findings": findings, "files_scanned": files}
 
 
 def _references_name_in_body(fn_node: ast.FunctionDef, name: str) -> bool:
@@ -87,16 +95,25 @@ def compliance_scan(root: Path = HERE) -> dict:
     its own body, not merely mention it. Vacuously compliant (1.0) if no send_* function exists yet -- nothing
     sends, so nothing can violate the rule; noted, not hidden.
 
-    Parses quillbox_app/main.py straight off disk -- not `import quillbox_app.main` -- on purpose. Found live,
+    Every .py in the package, not just main.py (round 142): scanning one file meant a candidate that moved
+    send_newsletter into quillbox_app/mail.py and dropped the unsubscribe link scored a clean 1.0 against a
+    guard whose rule is `min 1.0`. The rule is about the package, so the scan is too.
+
+    Parses the files straight off disk -- not `import quillbox_app.main` -- on purpose. Found live,
     round 132: a long-running server that imports the module once keeps seeing whichever candidate happened to be
     on disk at the moment of the first import, not the one actually staged. A real static scanner reads source
     text, it doesn't introspect an already-imported object."""
-    tree = ast.parse((root / "quillbox_app" / "main.py").read_text(encoding="utf-8"))
-    send_fns = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name.startswith("send_")]
+    send_fns = []
+    files = sorted(f for f in (root / "quillbox_app").rglob("*.py") if "__pycache__" not in f.parts)
+    for f in files:
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+        send_fns += [(f.name, n) for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name.startswith("send_")]
     if not send_fns:
-        return {"compliance_pass": 1.0, "checked": 0, "note": "vacuous: no send_* function exists yet"}
-    violations = [n.name for n in send_fns if not _references_name_in_body(n, "UNSUBSCRIBE_URL")]
-    return {"compliance_pass": 1.0 - (len(violations) / len(send_fns)), "checked": len(send_fns), "violations": violations}
+        return {"compliance_pass": 1.0, "checked": 0, "files_scanned": len(files),
+                "note": "vacuous: no send_* function exists anywhere in the package"}
+    violations = [f"{where}:{n.name}" for where, n in send_fns if not _references_name_in_body(n, "UNSUBSCRIBE_URL")]
+    return {"compliance_pass": 1.0 - (len(violations) / len(send_fns)), "checked": len(send_fns),
+            "files_scanned": len(files), "violations": violations}
 
 
 def static_report(root: Path = HERE, as_user: str = None) -> dict:
@@ -107,6 +124,7 @@ def static_report(root: Path = HERE, as_user: str = None) -> dict:
     df = run_defect_scan(root, as_user)
     cs = compliance_scan(root)
     return {"critical_defects": df["critical_defects"], "compliance_pass": cs["compliance_pass"],
+            "checked": cs["checked"], "files_scanned": cs["files_scanned"],
             "detail": {"defects": df, "compliance": cs}}
 
 
